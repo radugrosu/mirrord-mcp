@@ -1,13 +1,51 @@
 use anyhow::Result;
-use axum::{Json, Router, routing::post};
-use serde::Deserialize;
+use axum::{
+    Json, Router,
+    http::StatusCode,
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::process::Command;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct RunServiceRequest {
     command: String,
-    deployment: String,     // e.g., "user-service"
-    mirrord_config: String, // JSON string with placeholder target
+    deployment: String,
+    mirrord_config: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ToolParameters {
+    #[serde(rename = "type")]
+    param_type: String,
+    properties: serde_json::Map<String, Value>,
+    required: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ToolFunction {
+    name: String,
+    description: String,
+    parameters: ToolParameters,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ToolDefinition {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: ToolFunction,
+}
+
+async fn tools() -> Result<Json<Vec<ToolDefinition>>, StatusCode> {
+    let tool_json = include_str!("../tools/run_service.json");
+    let tool_function: ToolFunction =
+        serde_json::from_str(tool_json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tools = vec![ToolDefinition {
+        tool_type: "function".to_string(),
+        function: tool_function,
+    }];
+    Ok(Json(tools))
 }
 
 fn get_pod_name(deployment: &str, namespace: &str) -> Result<String, String> {
@@ -93,7 +131,9 @@ async fn run_service(Json(req): Json<RunServiceRequest>) -> Result<String, Strin
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/run-service", post(run_service));
+    let app = Router::new()
+        .route("/tools", get(tools))
+        .route("/run-service", post(run_service));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();

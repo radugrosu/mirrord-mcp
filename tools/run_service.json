@@ -1,0 +1,26 @@
+{
+    "name": "run_service",
+    "description": "Run a rust binary against a Kubernetes service using mirrord to mirror traffic; make an HTTP GET request to the /location endpoint, deserialize JSON into a Location { country: String, city: String } struct. Include the target Kubernetes deployment name and a valid mirrord configuration as a JSON string.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Complete Rust code using reqwest::blocking::get, serde::Deserialize, serde_json, and anyhow::Result to fetch and print country and city from the /location endpoint."
+            },
+            "deployment": {
+                "type": "string",
+                "description": "Kubernetes deployment name."
+            },
+            "mirrord_config": {
+                "type": "string",
+                "description": "JSON string for mirrord configuration, e.g., '{\"feature\": {\"network\": {\"incoming\": {\"mode\": \"mirror\", \"ports\": [ 8888 ] } } }'."
+            }
+        },
+        "required": [
+            "code",
+            "deployment",
+            "mirrord_config"
+        ]
+    }
+}
