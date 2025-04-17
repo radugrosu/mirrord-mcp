@@ -1,20 +1,13 @@
+use super::utils::get_pod_name;
 use anyhow::Result;
 use rmcp::Error as McpError;
-use rmcp::model::Content;
-use rmcp::{
-    ServerHandler,
-    model::{CallToolResult, ServerCapabilities, ServerInfo},
-    schemars, tool,
-};
-use serde::{Deserialize, Serialize};
+use rmcp::schemars;
 use std::{io::Write, path::Path, process::Command};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
-struct RunServiceRequest {}
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct MirrordRequest {
+pub struct Request {
     #[schemars(
         description = "Complete rust code using only reqwest::blocking::get, serde::Deserialize, serde_json, and anyhow::Result. The resulting binary is run against the cluster."
     )]
@@ -27,88 +20,7 @@ pub struct MirrordRequest {
     mirrord_config: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct MirrordService;
-
-impl MirrordService {
-    pub fn new() -> Self {
-        MirrordService {}
-    }
-}
-
-#[tool(tool_box)]
-impl MirrordService {
-    #[tool(
-        description = "Run a rust binary against a Kubernetes service using mirrord to mirror traffic"
-    )]
-    fn run_service(
-        &self,
-        #[tool(aggr)] request: MirrordRequest,
-    ) -> Result<CallToolResult, McpError> {
-        let result = run_service(request)?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
-    }
-}
-
-#[tool(tool_box)]
-impl ServerHandler for MirrordService {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Mirrord execution service".to_string()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
-    }
-}
-
-fn get_pod_name(deployment: &str, namespace: &str) -> Result<String, McpError> {
-    let output = Command::new("kubectl")
-        .arg("get")
-        .arg("pods")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-l")
-        .arg(format!("app={}", deployment))
-        .arg("-o")
-        .arg("jsonpath={.items[0].metadata.name}")
-        .output()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to run kubectl");
-            McpError::internal_error("Failed to execute kubectl command".to_string(), None)
-        })?;
-
-    if output.status.success() {
-        let pod_name = String::from_utf8(output.stdout).map_err(|e| {
-            tracing::error!(error = %e, "Invalid pod name");
-            McpError::internal_error(
-                "Failed to parse pod name from kubectl output".to_string(),
-                None,
-            )
-        })?;
-        if pod_name.is_empty() {
-            tracing::error!("No pod found for deployment");
-            Err(McpError::internal_error(
-                format!("No pod found for deployment: {}", deployment),
-                None,
-            ))
-        } else {
-            tracing::info!("Found pod: {}", pod_name);
-            Ok(pod_name)
-        }
-    } else {
-        let stderr = String::from_utf8(output.stderr).map_err(|e| {
-            tracing::error!(error = %e, "Failed to parse kubectl error");
-            McpError::internal_error("Failed to parse kubectl error output".to_string(), None)
-        })?;
-        tracing::error!(error = "kubectl failed", stderr);
-        Err(McpError::internal_error(
-            format!("kubectl failed {}", stderr),
-            None,
-        ))
-    }
-}
-
-fn run_service(request: MirrordRequest) -> Result<String, McpError> {
+pub fn run(request: Request) -> Result<String, McpError> {
     // Fetch the pod name for the deployment
     let pod_name = get_pod_name(&request.deployment, "default").map_err(|e| {
         tracing::error!(error = %e, "Failed to get pod name");
