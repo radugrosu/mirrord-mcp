@@ -1,5 +1,5 @@
 {
-    "name": "run_service",
+    "name": "run-service",
     "description": "Run a rust binary against a Kubernetes service using mirrord to mirror traffic",
     "parameters": {
         "type": "object",

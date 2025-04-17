@@ -2,12 +2,19 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{io::Write, path::Path, process::Command};
+use serde_json::{Value, json};
+use std::convert::Infallible;
+use std::time::Duration;
+use std::{collections::HashMap, io::Write, path::Path, process::Command};
 use tempfile::NamedTempFile;
+use tokio_stream::{StreamExt, wrappers::IntervalStream};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber;
 use uuid::Uuid;
@@ -41,8 +48,8 @@ struct ToolDefinition {
     function: ToolFunction,
 }
 
-async fn tools() -> Result<Json<Vec<ToolDefinition>>, StatusCode> {
-    let tool_json = include_str!("../tools/run_service.json");
+async fn tools() -> Result<Json<HashMap<String, Vec<ToolDefinition>>>, StatusCode> {
+    let tool_json = include_str!("../tools/run-service.json");
     let tool_function: ToolFunction =
         serde_json::from_str(tool_json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let tools = vec![ToolDefinition {
@@ -50,6 +57,7 @@ async fn tools() -> Result<Json<Vec<ToolDefinition>>, StatusCode> {
         function: tool_function,
     }];
     info!("Serving /tools endpoint with run_service tool");
+    let tools = HashMap::from([("tools".to_string(), tools)]);
     Ok(Json(tools))
 }
 
@@ -226,6 +234,40 @@ anyhow = "1.0"
     }
 }
 
+async fn sse_handler() -> impl IntoResponse {
+    info!("SSE endpoint hit");
+
+    // One-time "ready" message
+    let initial_event = Ok::<Event, Infallible>(
+        Event::default().event("ready").data(
+            json!({
+                "type": "status",
+                "status": "ready"
+            })
+            .to_string(),
+        ),
+    );
+
+    // Repeating keep-alive events every 5s
+    let interval = tokio::time::interval(Duration::from_secs(5));
+    let stream = IntervalStream::new(interval).map(|_| {
+        Ok::<Event, Infallible>(
+            Event::default().event("keep-alive").data(
+                json!({
+                    "type": "keep-alive",
+                    "message": "still here"
+                })
+                .to_string(),
+            ),
+        )
+    });
+
+    // Chain the one-time ready message with the keep-alive stream
+    let full_stream = tokio_stream::once(initial_event).chain(stream);
+
+    Sse::new(full_stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -234,7 +276,8 @@ async fn main() {
     info!("Starting MCP server on port 3000");
     let app = Router::new()
         .route("/tools", get(tools))
-        .route("/run-service", post(run_service));
+        .route("/run-service", post(run_service))
+        .route("/sse", get(sse_handler));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
