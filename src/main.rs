@@ -1,284 +1,48 @@
-use anyhow::Result;
-use axum::{
-    Json, Router,
-    http::StatusCode,
-    response::{
-        IntoResponse,
-        sse::{Event, Sse},
-    },
-    routing::{get, post},
+mod run_service;
+use rmcp::transport::sse_server::{SseServer, SseServerConfig};
+use run_service::MirrordService;
+use tracing_subscriber::{
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    {self},
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::convert::Infallible;
-use std::time::Duration;
-use std::{collections::HashMap, io::Write, path::Path, process::Command};
-use tempfile::NamedTempFile;
-use tokio_stream::{StreamExt, wrappers::IntervalStream};
-use tracing::{debug, error, info, warn};
-use tracing_subscriber;
-use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
-struct RunServiceRequest {
-    code: String,
-    deployment: String,
-    mirrord_config: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ToolParameters {
-    #[serde(rename = "type")]
-    param_type: String,
-    properties: serde_json::Map<String, Value>,
-    required: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ToolFunction {
-    name: String,
-    description: String,
-    parameters: ToolParameters,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ToolDefinition {
-    #[serde(rename = "type")]
-    tool_type: String,
-    function: ToolFunction,
-}
-
-async fn tools() -> Result<Json<HashMap<String, Vec<ToolDefinition>>>, StatusCode> {
-    let tool_json = include_str!("../tools/run-service.json");
-    let tool_function: ToolFunction =
-        serde_json::from_str(tool_json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let tools = vec![ToolDefinition {
-        tool_type: "function".to_string(),
-        function: tool_function,
-    }];
-    info!("Serving /tools endpoint with run_service tool");
-    let tools = HashMap::from([("tools".to_string(), tools)]);
-    Ok(Json(tools))
-}
-
-fn get_pod_name(deployment: &str, namespace: &str) -> Result<String, StatusCode> {
-    let output = Command::new("kubectl")
-        .arg("get")
-        .arg("pods")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-l")
-        .arg(format!("app={}", deployment))
-        .arg("-o")
-        .arg("jsonpath={.items[0].metadata.name}")
-        .output()
-        .map_err(|e| {
-            error!("Failed to run kubectl: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    if output.status.success() {
-        let pod_name = String::from_utf8(output.stdout).map_err(|e| {
-            error!("Invalid pod name: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        if pod_name.is_empty() {
-            error!("No pod found for deployment: {}", deployment);
-            Err(StatusCode::NOT_FOUND)
-        } else {
-            info!("Found pod: {}", pod_name);
-            Ok(pod_name)
-        }
-    } else {
-        let stderr = String::from_utf8(output.stderr).map_err(|e| {
-            error!("Invalid kubectl error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        error!("kubectl failed: {}", stderr);
-        Err(StatusCode::INTERNAL_SERVER_ERROR)
-    }
-}
-
-async fn run_service(Json(req): Json<RunServiceRequest>) -> Result<String, StatusCode> {
-    // Fetch the pod name for the deployment
-    let pod_name = get_pod_name(&req.deployment, "default").map_err(|e| {
-        error!("Failed to get pod name: {}", e);
-        StatusCode::NOT_FOUND
-    })?;
-
-    // Update mirrord config with the pod name
-    let config: serde_json::Value = serde_json::from_str(&req.mirrord_config).map_err(|e| {
-        error!("Failed to parse mirrord config: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
-
-    let updated_config = serde_json::json!({
-        "target": {
-            "namespace": "default",
-            "path": format!("pod/{}", pod_name)
-        },
-        "feature": config["feature"]
-    });
-    let config_str = serde_json::to_string(&updated_config).map_err(|e| {
-        error!("Failed to serialize mirrord config: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
-
-    // Create temporary project directory
-    let project_dir = format!("/tmp/mirrord_agent_code_{}", Uuid::new_v4());
-    debug!("Creating project directory: {}", project_dir);
-    std::fs::create_dir_all(format!("{}/src", &project_dir)).map_err(|e| {
-        error!("Failed to create project directory: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Write Cargo.toml
-    let cargo_toml = r#"
-[package]
-name = "agent-code"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-reqwest = { version = "0.12", features = ["json", "blocking"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
-"#;
-    std::fs::write(format!("{}/Cargo.toml", &project_dir), cargo_toml).map_err(|e| {
-        error!("Failed to write Cargo.toml: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    debug!("Wrote Cargo.toml to {}", project_dir);
-
-    // Write main.rs
-    std::fs::write(format!("{}/src/main.rs", &project_dir), &req.code).map_err(|e| {
-        error!("Failed to write main.rs: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    debug!("Wrote main.rs with code length: {} bytes", req.code.len());
-
-    // Compile
-    info!("Compiling Rust code in {}", project_dir);
-    let compile_output = Command::new("cargo")
-        .current_dir(&project_dir)
-        .args(["build", "--release"])
-        .output()
-        .map_err(|e| {
-            error!("Failed to execute cargo build: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    if !compile_output.status.success() {
-        let err = String::from_utf8_lossy(&compile_output.stderr);
-        error!("Build failed: {}", err);
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    info!("Compilation succeeded");
-
-    let binary_path = format!("{}/target/release/agent-code", &project_dir);
-    if !Path::new(&binary_path).exists() {
-        error!("Binary not found at: {}", binary_path);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-    debug!("Binary created at {}", binary_path);
-
-    // Write mirrord config to temp file
-    let mut config_file = NamedTempFile::with_suffix(".json").map_err(|e| {
-        error!("Failed to create temp file: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    config_file.write_all(config_str.as_bytes()).map_err(|e| {
-        error!("Failed to write mirrord config: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let config_path = config_file
-        .path()
-        .to_str()
-        .ok_or_else(|| {
-            error!("Failed to convert path to string");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .to_string();
-    debug!("Wrote mirrord config to {}", config_path);
-
-    // Run mirrord
-    info!("Executing mirrord for pod: {}", pod_name);
-    let output = Command::new("mirrord")
-        .arg("exec")
-        .arg("--config-file")
-        .arg(&config_path)
-        .arg(&binary_path)
-        .output()
-        .map_err(|e| {
-            error!("Failed to execute mirrord: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Clean up
-    let _ = std::fs::remove_dir_all(&project_dir);
-    let _ = config_file.close();
-    debug!("Cleaned up project directory and config file");
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        info!("Mirrord execution succeeded");
-        debug!("stdout: '{}', stderr: '{}'", stdout, stderr);
-        Ok(stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        warn!("Mirrord execution failed: {}", stderr);
-        warn!("Mirrord config used: {}", config_str);
-        Err(StatusCode::INTERNAL_SERVER_ERROR)
-    }
-}
-
-async fn sse_handler() -> impl IntoResponse {
-    info!("SSE endpoint hit");
-
-    // One-time "ready" message
-    let initial_event = Ok::<Event, Infallible>(
-        Event::default().event("ready").data(
-            json!({
-                "type": "status",
-                "status": "ready"
-            })
-            .to_string(),
-        ),
-    );
-
-    // Repeating keep-alive events every 5s
-    let interval = tokio::time::interval(Duration::from_secs(5));
-    let stream = IntervalStream::new(interval).map(|_| {
-        Ok::<Event, Infallible>(
-            Event::default().event("keep-alive").data(
-                json!({
-                    "type": "keep-alive",
-                    "message": "still here"
-                })
-                .to_string(),
-            ),
-        )
-    });
-
-    // Chain the one-time ready message with the keep-alive stream
-    let full_stream = tokio_stream::once(initial_event).chain(stream);
-
-    Sse::new(full_stream).keep_alive(axum::response::sse::KeepAlive::default())
-}
+const BIND_ADDRESS: &str = "127.0.0.1:3000";
 
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "debug".to_string().into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
         .init();
-    info!("Starting MCP server on port 3000");
-    let app = Router::new()
-        .route("/tools", get(tools))
-        .route("/run-service", post(run_service))
-        .route("/sse", get(sse_handler));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let config = SseServerConfig {
+        bind: BIND_ADDRESS.parse()?,
+        sse_path: "/sse".to_string(),
+        post_path: "/message".to_string(),
+        ct: tokio_util::sync::CancellationToken::new(),
+        sse_keep_alive: None,
+    };
+
+    let (sse_server, router) = SseServer::new(config);
+    // Do something with the router, e.g., add routes or middleware
+    let listener = tokio::net::TcpListener::bind(sse_server.config.bind).await?;
+    let ct = sse_server.config.ct.child_token();
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        ct.cancelled().await;
+        tracing::info!("sse server cancelled");
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = server.await {
+            tracing::error!(error = %e, "sse server shutdown with error");
+        }
+    });
+    let ct = sse_server.with_service(MirrordService::new);
+    tokio::signal::ctrl_c().await?;
+    ct.cancel();
+    Ok(())
 }
