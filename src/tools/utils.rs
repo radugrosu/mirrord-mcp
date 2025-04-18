@@ -48,3 +48,34 @@ pub fn get_pod_name(deployment: &str, namespace: &str) -> Result<String, McpErro
         ))
     }
 }
+
+pub fn update_mirrord_config(
+    mirrord_config: &str,
+    deployment: &str,
+    namespace: &str,
+) -> Result<String, McpError> {
+    // Fetch the pod name for the deployment
+    let pod_name = get_pod_name(deployment, namespace).map_err(|e| {
+        tracing::error!(error = %e, "Failed to get pod name");
+        e
+    })?;
+
+    // Update mirrord config with the pod name
+    let config: serde_json::Value = serde_json::from_str(mirrord_config).map_err(|e| {
+        tracing::error!(error = %e, "Failed to parse mirrord config");
+        McpError::internal_error("Failed to parse mirrord config".to_string(), None)
+    })?;
+
+    let updated_config = serde_json::json!({
+        "target": {
+            "namespace": namespace,
+            "path": format!("pod/{}", pod_name)
+        },
+        "feature": config["feature"]
+    });
+    let config_str = serde_json::to_string(&updated_config).map_err(|e| {
+        tracing::error!(error = %e, "Failed to serialize mirrord config");
+        McpError::internal_error("Failed to serialize mirrord config".to_string(), None)
+    })?;
+    Ok(config_str)
+}

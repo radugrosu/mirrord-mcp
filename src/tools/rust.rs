@@ -1,4 +1,4 @@
-use super::utils::get_pod_name;
+use crate::tools::utils::update_mirrord_config;
 use anyhow::Result;
 use rmcp::Error as McpError;
 use rmcp::schemars;
@@ -21,30 +21,6 @@ pub struct Request {
 }
 
 pub fn run(request: Request) -> Result<String, McpError> {
-    // Fetch the pod name for the deployment
-    let pod_name = get_pod_name(&request.deployment, "default").map_err(|e| {
-        tracing::error!(error = %e, "Failed to get pod name");
-        e
-    })?;
-
-    // Update mirrord config with the pod name
-    let config: serde_json::Value = serde_json::from_str(&request.mirrord_config).map_err(|e| {
-        tracing::error!(error = %e, "Failed to parse mirrord config");
-        McpError::internal_error("Failed to parse mirrord config".to_string(), None)
-    })?;
-
-    let updated_config = serde_json::json!({
-        "target": {
-            "namespace": "default",
-            "path": format!("pod/{}", pod_name)
-        },
-        "feature": config["feature"]
-    });
-    let config_str = serde_json::to_string(&updated_config).map_err(|e| {
-        tracing::error!(error = %e, "Failed to serialize mirrord config");
-        McpError::internal_error("Failed to serialize mirrord config".to_string(), None)
-    })?;
-
     // Create temporary project directory
     let project_dir = format!("/tmp/mirrord_agent_code_{}", Uuid::new_v4());
     tracing::debug!("Creating project directory: {}", project_dir);
@@ -53,6 +29,65 @@ pub fn run(request: Request) -> Result<String, McpError> {
         McpError::internal_error("Failed to create project directory".to_string(), None)
     })?;
 
+    let config_str =
+        update_mirrord_config(&request.mirrord_config, &request.deployment, "default")?;
+
+    let binary_path = compile_rust(&request.code, &project_dir)?;
+
+    // Write mirrord config to temp file
+    let mut config_file = NamedTempFile::with_suffix(".json").map_err(|e| {
+        tracing::error!(error = %e, "Failed to create temp file");
+        McpError::internal_error("Failed to create temp file".to_string(), None)
+    })?;
+    config_file.write_all(config_str.as_bytes()).map_err(|e| {
+        tracing::error!(error = %e, "Failed to write mirrord config");
+        McpError::internal_error("Failed to write mirrord config".to_string(), None)
+    })?;
+    let config_path = config_file
+        .path()
+        .to_str()
+        .ok_or_else(|| {
+            tracing::error!("Failed to convert path to string");
+            McpError::internal_error("Failed to convert path to string".to_string(), None)
+        })?
+        .to_string();
+    tracing::debug!("Wrote mirrord config to {}", config_path);
+
+    // Run mirrord
+    let output = Command::new("mirrord")
+        .arg("exec")
+        .arg("--config-file")
+        .arg(&config_path)
+        .arg(&binary_path)
+        .output()
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to execute mirrord");
+            McpError::internal_error("Failed to execute mirrord".to_string(), None)
+        })?;
+
+    // Clean up
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let _ = config_file.close();
+    tracing::debug!("Cleaned up project directory and config file");
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        tracing::info!("Mirrord execution succeeded");
+        tracing::debug!("stdout: '{}', stderr: '{}'", stdout, stderr);
+        Ok(stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        tracing::error!(error = stderr, "Mirrord execution failed");
+        tracing::debug!("Mirrord config used: {}", config_str);
+        Err(McpError::internal_error(
+            format!("Mirrord execution failed: {}", stderr),
+            None,
+        ))
+    }
+}
+
+fn compile_rust(code: &str, project_dir: &str) -> Result<String, McpError> {
     let compile_mode = std::env::var("MCP_SERVICE_COMPILE_MODE").unwrap_or("release".to_string());
     tracing::debug!("Compile mode: {}", compile_mode);
 
@@ -95,14 +130,11 @@ codegen-units = 16
     tracing::debug!("Wrote Cargo.toml to {}", project_dir);
 
     // Write main.rs
-    std::fs::write(format!("{}/src/main.rs", &project_dir), &request.code).map_err(|e| {
+    std::fs::write(format!("{}/src/main.rs", &project_dir), code).map_err(|e| {
         tracing::error!(error = %e, "Failed to write main.rs");
         McpError::internal_error("Failed to write main.rs".to_string(), None)
     })?;
-    tracing::debug!(
-        "Wrote main.rs with code length: {} bytes",
-        request.code.len()
-    );
+    tracing::debug!("Wrote main.rs with code length: {} bytes", code.len());
 
     // Compile
     tracing::info!("Compiling Rust code in {}", project_dir);
@@ -111,7 +143,7 @@ codegen-units = 16
         _ => &["build", "--release"][..],
     };
     let compile_output = Command::new("cargo")
-        .current_dir(&project_dir)
+        .current_dir(project_dir)
         .args(compile_args)
         .output()
         .map_err(|e| {
@@ -138,57 +170,5 @@ codegen-units = 16
         ));
     }
     tracing::debug!("Binary created at {}", binary_path);
-
-    // Write mirrord config to temp file
-    let mut config_file = NamedTempFile::with_suffix(".json").map_err(|e| {
-        tracing::error!(error = %e, "Failed to create temp file");
-        McpError::internal_error("Failed to create temp file".to_string(), None)
-    })?;
-    config_file.write_all(config_str.as_bytes()).map_err(|e| {
-        tracing::error!(error = %e, "Failed to write mirrord config");
-        McpError::internal_error("Failed to write mirrord config".to_string(), None)
-    })?;
-    let config_path = config_file
-        .path()
-        .to_str()
-        .ok_or_else(|| {
-            tracing::error!("Failed to convert path to string");
-            McpError::internal_error("Failed to convert path to string".to_string(), None)
-        })?
-        .to_string();
-    tracing::debug!("Wrote mirrord config to {}", config_path);
-
-    // Run mirrord
-    tracing::info!("Executing mirrord for pod: {}", pod_name);
-    let output = Command::new("mirrord")
-        .arg("exec")
-        .arg("--config-file")
-        .arg(&config_path)
-        .arg(&binary_path)
-        .output()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to execute mirrord");
-            McpError::internal_error("Failed to execute mirrord".to_string(), None)
-        })?;
-
-    // Clean up
-    let _ = std::fs::remove_dir_all(&project_dir);
-    let _ = config_file.close();
-    tracing::debug!("Cleaned up project directory and config file");
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        tracing::info!("Mirrord execution succeeded");
-        tracing::debug!("stdout: '{}', stderr: '{}'", stdout, stderr);
-        Ok(stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        tracing::error!(error = stderr, "Mirrord execution failed");
-        tracing::debug!("Mirrord config used: {}", config_str);
-        Err(McpError::internal_error(
-            format!("Mirrord execution failed: {}", stderr),
-            None,
-        ))
-    }
+    Ok(binary_path)
 }
