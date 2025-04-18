@@ -1,10 +1,10 @@
-use crate::tools::utils::update_mirrord_config;
+use super::utils::update_mirrord_config;
 use anyhow::Result;
 use rmcp::Error as McpError;
 use rmcp::schemars;
+use std::path::PathBuf;
 use std::{io::Write, path::Path, process::Command};
 use tempfile::NamedTempFile;
-use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct Request {
@@ -22,17 +22,17 @@ pub struct Request {
 
 pub fn run(request: Request) -> Result<String, McpError> {
     // Create temporary project directory
-    let project_dir = format!("/tmp/mirrord_agent_code_{}", Uuid::new_v4());
-    tracing::debug!("Creating project directory: {}", project_dir);
-    std::fs::create_dir_all(format!("{}/src", &project_dir)).map_err(|e| {
-        tracing::error!(error=%e, "Failed to create project directory");
-        McpError::internal_error("Failed to create project directory".to_string(), None)
+    let temp_dir = tempfile::tempdir().map_err(|e| {
+        tracing::error!(error = %e, "Failed to create temporary directory");
+        McpError::internal_error("Failed to create temporary directory".to_string(), None)
     })?;
+    let project_dir = temp_dir.path();
+    tracing::debug!("Created project directory: {}", project_dir.display());
 
     let config_str =
         update_mirrord_config(&request.mirrord_config, &request.deployment, "default")?;
 
-    let binary_path = compile_rust(&request.code, &project_dir)?;
+    let binary_path = compile_rust(&request.code, project_dir)?;
 
     // Write mirrord config to temp file
     let mut config_file = NamedTempFile::with_suffix(".json").map_err(|e| {
@@ -65,11 +65,6 @@ pub fn run(request: Request) -> Result<String, McpError> {
             McpError::internal_error("Failed to execute mirrord".to_string(), None)
         })?;
 
-    // Clean up
-    let _ = std::fs::remove_dir_all(&project_dir);
-    let _ = config_file.close();
-    tracing::debug!("Cleaned up project directory and config file");
-
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -87,7 +82,7 @@ pub fn run(request: Request) -> Result<String, McpError> {
     }
 }
 
-fn compile_rust(code: &str, project_dir: &str) -> Result<String, McpError> {
+fn compile_rust(code: &str, project_dir: &Path) -> Result<PathBuf, McpError> {
     let compile_mode = std::env::var("MCP_SERVICE_COMPILE_MODE").unwrap_or("release".to_string());
     tracing::debug!("Compile mode: {}", compile_mode);
 
@@ -123,21 +118,21 @@ codegen-units = 16
         );
     }
 
-    std::fs::write(format!("{}/Cargo.toml", &project_dir), cargo_toml).map_err(|e| {
+    std::fs::write(project_dir.join("Cargo.toml"), cargo_toml).map_err(|e| {
         tracing::error!(error = %e, "Failed to write Cargo.toml");
         McpError::internal_error("Failed to write Cargo.toml".to_string(), None)
     })?;
-    tracing::debug!("Wrote Cargo.toml to {}", project_dir);
+    tracing::debug!("Wrote Cargo.toml to {}", project_dir.display());
 
     // Write main.rs
-    std::fs::write(format!("{}/src/main.rs", &project_dir), code).map_err(|e| {
+    std::fs::write(project_dir.join("src").join("main.rs"), code).map_err(|e| {
         tracing::error!(error = %e, "Failed to write main.rs");
         McpError::internal_error("Failed to write main.rs".to_string(), None)
     })?;
     tracing::debug!("Wrote main.rs with code length: {} bytes", code.len());
 
     // Compile
-    tracing::info!("Compiling Rust code in {}", project_dir);
+    tracing::info!("Compiling Rust code in {}", project_dir.display());
     let compile_args = match compile_mode.as_str() {
         "debug" => &["build"][..],
         _ => &["build", "--release"][..],
@@ -161,14 +156,17 @@ codegen-units = 16
     }
     tracing::info!("Compilation succeeded");
 
-    let binary_path = format!("{}/target/{}/agent-code", &project_dir, &compile_mode);
-    if !Path::new(&binary_path).exists() {
-        tracing::error!("Binary not found at: {}", binary_path);
+    let binary_path = project_dir
+        .join("target")
+        .join(compile_mode)
+        .join("agent-code");
+    if !&binary_path.exists() {
+        tracing::error!("Binary not found at: {}", binary_path.display());
         return Err(McpError::internal_error(
-            format!("Binary not found at: {}", binary_path),
+            format!("Binary not found at: {}", binary_path.display()),
             None,
         ));
     }
-    tracing::debug!("Binary created at {}", binary_path);
+    tracing::debug!("Binary created at {}", binary_path.display());
     Ok(binary_path)
 }

@@ -8,6 +8,7 @@ use rmcp::{
 };
 
 use super::node;
+use super::python;
 use super::rust;
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,16 @@ impl MirrordService {
     )]
     fn run_node(&self, #[tool(aggr)] request: node::Request) -> Result<CallToolResult, McpError> {
         let result = node::run(request)?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+    #[tool(
+        description = "Run a Python script against a Kubernetes service using mirrord to mirror traffic"
+    )]
+    fn run_python(
+        &self,
+        #[tool(aggr)] request: python::Request,
+    ) -> Result<CallToolResult, McpError> {
+        let result = python::run(request)?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 }
