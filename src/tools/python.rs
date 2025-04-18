@@ -1,10 +1,10 @@
-use super::utils::update_mirrord_config;
+use super::executor::execute_mirrord_run;
+use super::runnable::MirrordRunnable;
 use anyhow::Result;
 use rmcp::Error as McpError;
 use rmcp::schemars;
+use std::ffi::OsString; // Use OsString for command args
 use std::path::Path;
-use std::{io::Write, process::Command};
-use tempfile::NamedTempFile;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct Request {
@@ -19,66 +19,92 @@ pub struct Request {
     )]
     mirrord_config: String,
 }
+struct PythonRunner<'a> {
+    code: &'a str,
+}
+impl MirrordRunnable for PythonRunner<'_> {
+    fn setup_project(&self, project_dir: &Path) -> Result<(), McpError> {
+        let main_py_path = project_dir.join("main.py");
+        std::fs::write(&main_py_path, self.code).map_err(|e| {
+            tracing::error!(error = %e, path = %main_py_path.display(), "Failed to write main.py");
+            McpError::internal_error("Failed to write main.py".to_string(), None)
+        })?;
+        tracing::debug!(
+            "Wrote main.py to {} with code length: {} bytes",
+            main_py_path.display(),
+            self.code.len()
+        );
 
-pub fn run(request: Request) -> Result<String, McpError> {
-    // Create temporary project directory
-    let temp_dir = tempfile::tempdir().map_err(|e| {
-        tracing::error!(error = %e, "Failed to create temporary directory");
-        McpError::internal_error("Failed to create temporary directory".to_string(), None)
-    })?;
-    let project_dir = temp_dir.path();
-    tracing::debug!("Created project directory: {}", project_dir.display());
-
-    let config_str =
-        update_mirrord_config(&request.mirrord_config, &request.deployment, "default")?;
-    // Write main.py
-    std::fs::write(Path::new(project_dir).join("main.py"), &request.code).map_err(|e| {
-        tracing::error!(error = %e, "Failed to write main.py");
-        McpError::internal_error("Failed to write main.py".to_string(), None)
-    })?;
-    tracing::debug!(
-        "Wrote main.py with code length: {} bytes",
-        request.code.len()
-    );
-
-    // Write mirrord config to temp file
-    let mut config_file = NamedTempFile::with_suffix(".json").map_err(|e| {
-        tracing::error!(error = %e, "Failed to create temp file");
-        McpError::internal_error("Failed to create temp file".to_string(), None)
-    })?;
-    config_file.write_all(config_str.as_bytes()).map_err(|e| {
-        tracing::error!(error = %e, "Failed to write mirrord config");
-        McpError::internal_error("Failed to write mirrord config".to_string(), None)
-    })?;
-    let config_path = config_file.path();
-    tracing::debug!("Wrote mirrord config to {}", config_path.display());
-
-    // Run mirrord
-    let output = Command::new("mirrord")
-        .arg("exec")
-        .arg("--config-file")
-        .arg(config_path)
-        .arg("python3")
-        .arg(Path::new(project_dir).join("main.py"))
-        .output()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to execute mirrord");
-            McpError::internal_error("Failed to execute mirrord".to_string(), None)
+        // -- Handle Python dependencies --
+        let requirements = "requests\n"; // Assuming 'json' is standard lib, but 'requests' needs install
+        let req_path = project_dir.join("requirements.txt");
+        std::fs::write(&req_path, requirements).map_err(|e| {
+             tracing::error!(error = %e, path = %req_path.display(), "Failed to write requirements.txt");
+            McpError::internal_error("Failed to write requirements.txt".to_string(), None)
         })?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        tracing::info!("Mirrord execution succeeded");
-        tracing::debug!("stdout: '{}', stderr: '{}'", stdout, stderr);
-        Ok(stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        tracing::error!(error = stderr, "Mirrord execution failed");
-        tracing::debug!("Mirrord config used: {}", config_str);
-        Err(McpError::internal_error(
-            format!("Mirrord execution failed: {}", stderr),
-            None,
-        ))
+        let venv_path = project_dir.join(".venv");
+        let venv_output = std::process::Command::new("python3")
+            .arg("-m")
+            .arg("venv")
+            .arg(&venv_path)
+            .output()
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to create python venv: {}", e), None)
+            })?;
+        if !venv_output.status.success() {
+            let stderr = String::from_utf8_lossy(&venv_output.stderr);
+            tracing::error!(error=%stderr, "Failed to create python venv");
+            return Err(McpError::internal_error(
+                format!("Failed to create python venv: {}", stderr),
+                None,
+            ));
+        }
+
+        // Install dependencies into venv
+        let pip_path = venv_path.join("bin").join("pip");
+        let install_output = std::process::Command::new(pip_path)
+            .arg("install")
+            .arg("-r")
+            .arg(&req_path)
+            .output()
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to run pip install: {}", e), None)
+            })?;
+
+        if !install_output.status.success() {
+            let stderr = String::from_utf8_lossy(&install_output.stderr);
+            tracing::error!(error=%stderr, "pip install failed");
+            return Err(McpError::internal_error(
+                format!("pip install failed: {}", stderr),
+                None,
+            ));
+        }
+        tracing::info!("Python dependencies installed successfully.");
+        Ok(())
     }
+
+    fn get_command_args(&self, project_dir: &Path) -> Result<Vec<OsString>, McpError> {
+        let python_executable = project_dir.join(".venv").join("bin").join("python");
+        let script_path = project_dir.join("main.py");
+        Ok(vec![
+            python_executable.into(), // Convert PathBuf to OsString
+            script_path.into(),
+        ])
+    }
+}
+
+pub fn run(request: Request) -> Result<String, McpError> {
+    // Create the runner instance, passing necessary data from the request
+    let runner = PythonRunner {
+        code: &request.code,
+    };
+
+    // Call the shared executor function with the runner instance
+    execute_mirrord_run(
+        &runner,
+        &request.deployment,
+        &request.mirrord_config,
+        "default", // Namespace - make configurable later if needed
+    )
 }
