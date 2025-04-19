@@ -54,28 +54,33 @@ pub fn update_mirrord_config(
     deployment: &str,
     namespace: &str,
 ) -> Result<String, McpError> {
-    // Fetch the pod name for the deployment
     let pod_name = get_pod_name(deployment, namespace).map_err(|e| {
         tracing::error!(error = %e, "Failed to get pod name");
         e
     })?;
 
-    // Update mirrord config with the pod name
-    let config: serde_json::Value = serde_json::from_str(mirrord_config).map_err(|e| {
-        tracing::error!(error = %e, "Failed to parse mirrord config");
-        McpError::internal_error("Failed to parse mirrord config".to_string(), None)
+    let mut config_value: serde_json::Value =
+        serde_json::from_str(mirrord_config).map_err(|e| {
+            tracing::error!(error = %e, "Failed to parse mirrord config");
+            McpError::internal_error("Failed to parse mirrord config".to_string(), None)
+        })?;
+
+    // Ensure the top level is an object
+    let config_obj = config_value.as_object_mut().ok_or_else(|| {
+        tracing::error!("Mirrord config is not a JSON object");
+        McpError::internal_error("Mirrord config must be a JSON object".to_string(), None)
     })?;
 
-    let updated_config = serde_json::json!({
-        "target": {
-            "namespace": namespace,
-            "path": format!("pod/{}", pod_name)
-        },
-        "feature": config["feature"]
+    // Create or update the "target" field
+    let target_value = serde_json::json!({
+        "namespace": namespace,
+        "path": format!("pod/{}", pod_name)
     });
-    let config_str = serde_json::to_string(&updated_config).map_err(|e| {
-        tracing::error!(error = %e, "Failed to serialize mirrord config");
+    config_obj.insert("target".to_string(), target_value);
+
+    // Serialize the modified config
+    serde_json::to_string(&config_value).map_err(|e| {
+        tracing::error!(error = %e, "Failed to serialize updated mirrord config");
         McpError::internal_error("Failed to serialize mirrord config".to_string(), None)
-    })?;
-    Ok(config_str)
+    })
 }
