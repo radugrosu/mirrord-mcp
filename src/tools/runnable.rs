@@ -8,7 +8,7 @@ pub trait MirrordRunnable {
     /// Sets up the temporary project directory.
     /// This includes writing source files, dependency manifests (like package.json, Cargo.toml, requirements.txt),
     /// and potentially installing dependencies.
-    fn setup_project(&self, project_dir: &Path) -> Result<(), McpError>;
+    async fn setup_project(&self, project_dir: &Path) -> Result<(), McpError>;
 
     /// Gets the command and arguments to execute via `mirrord exec`.
     /// This typically includes the language interpreter/binary and the main script/executable path.

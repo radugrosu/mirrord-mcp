@@ -3,7 +3,12 @@ use anyhow::Result;
 use rmcp::Error as McpError;
 use std::io::Write;
 use std::process::Command;
+use std::time::Duration;
 use tempfile::{NamedTempFile, TempPath}; // Use TempPath for config file persistence
+use tokio::task;
+use tokio::time::timeout;
+
+const MIRRORD_EXEC_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
 
 /// Executes a language-specific script/binary using mirrord.
 ///
@@ -22,7 +27,7 @@ use tempfile::{NamedTempFile, TempPath}; // Use TempPath for config file persist
 ///
 /// # Returns
 /// The stdout of the successful execution, or an McpError.
-pub fn execute_mirrord_run<R: MirrordRunnable>(
+pub async fn execute_mirrord_run<R: MirrordRunnable>(
     runner: &R,
     deployment: &str,
     mirrord_config: &str,
@@ -37,14 +42,15 @@ pub fn execute_mirrord_run<R: MirrordRunnable>(
     tracing::debug!("Created project directory: {}", project_dir.display());
 
     // --- 2. Run Language-Specific Setup ---
-    runner.setup_project(project_dir).inspect_err(|_| {
+    runner.setup_project(project_dir).await.inspect_err(|_| {
         tracing::error!("Project setup failed in {}", project_dir.display());
     })?;
     tracing::debug!("Project setup completed for {}", project_dir.display());
 
     // --- 3. Update and Write Mirrord Config ---
-    let config_str =
-        update_mirrord_config(mirrord_config, deployment, namespace).inspect_err(|e| {
+    let config_str = update_mirrord_config(mirrord_config, deployment, namespace)
+        .await
+        .inspect_err(|e| {
             tracing::error!(error = ?e, "Failed to update mirrord config");
         })?;
 
@@ -68,26 +74,60 @@ pub fn execute_mirrord_run<R: MirrordRunnable>(
     tracing::debug!("Command args to execute: {:?}", command_args);
 
     // --- 5. Execute Mirrord ---
-    let mut command = Command::new("mirrord");
-    command.arg("exec").arg("--config-file").arg(&config_path);
-    // language-specific executable and args
-    for arg in command_args {
-        command.arg(arg);
-    }
-
-    tracing::info!(command = ?command, "Executing mirrord command...");
-    let output = command.output().map_err(|e| {
-        tracing::error!(error = %e, command = ?command, "Failed to execute mirrord command");
-        // Check if the error is 'NotFound'
-        if e.kind() == std::io::ErrorKind::NotFound {
-            McpError::internal_error(
-                "Failed to execute mirrord: 'mirrord' command not found in PATH.".to_string(),
-                None,
-            )
-        } else {
-            McpError::internal_error(format!("Failed to start mirrord process: {}", e), None)
+    let config_path_owned = config_path.to_path_buf(); // Clone PathBuf to move into task
+    let blocking_task = task::spawn_blocking(move || {
+        let mut command = Command::new("mirrord");
+        command
+            .arg("exec")
+            .arg("--config-file")
+            .arg(&config_path_owned); // Use owned path
+        for arg in command_args {
+            command.arg(arg);
         }
-    })?;
+        tracing::info!(command = ?command, "Executing mirrord command in blocking task...");
+        command.output() // Execute the command
+    });
+
+    let output = match timeout(MIRRORD_EXEC_TIMEOUT, blocking_task).await {
+        Ok(Ok(Ok(output))) => Ok(output), // All succeeded
+        Ok(Ok(Err(e))) => {
+            // Command::output failed
+            tracing::error!(error = %e, "Failed to run mirrord command");
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Err(McpError::internal_error(
+                    "Failed to execute mirrord: 'mirrord' command not found in PATH.".to_string(),
+                    None,
+                ))
+            } else {
+                Err(McpError::internal_error(
+                    format!("Failed to start mirrord process: {}", e),
+                    None,
+                ))
+            }
+        }
+        Ok(Err(e)) => {
+            // spawn_blocking failed
+            tracing::error!(error = %e, "mirrord blocking task failed");
+            Err(McpError::internal_error(
+                format!("mirrord task failed: {}", e),
+                None,
+            ))
+        }
+        Err(_) => {
+            // Timeout elapsed
+            tracing::error!(
+                "Mirrord execution timed out after {:?}",
+                MIRRORD_EXEC_TIMEOUT
+            );
+            Err(McpError::internal_error(
+                format!(
+                    "Mirrord execution timed out after {:?}",
+                    MIRRORD_EXEC_TIMEOUT
+                ),
+                None,
+            ))
+        }
+    }?;
 
     // --- 6. Handle Output ---
     if output.status.success() {

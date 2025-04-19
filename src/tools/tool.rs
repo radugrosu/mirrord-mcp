@@ -25,25 +25,31 @@ impl MirrordService {
     #[tool(
         description = "Run a rust binary against a Kubernetes service using mirrord to mirror traffic"
     )]
-    fn run_rust(&self, #[tool(aggr)] request: rust::Request) -> Result<CallToolResult, McpError> {
-        let result = rust::run(request)?;
+    async fn run_rust(
+        &self,
+        #[tool(aggr)] request: rust::Request,
+    ) -> Result<CallToolResult, McpError> {
+        let result = rust::run(request).await?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
     #[tool(
         description = "Run a JavaScript script against a Kubernetes service using mirrord to mirror traffic"
     )]
-    fn run_node(&self, #[tool(aggr)] request: node::Request) -> Result<CallToolResult, McpError> {
-        let result = node::run(request)?;
+    async fn run_node(
+        &self,
+        #[tool(aggr)] request: node::Request,
+    ) -> Result<CallToolResult, McpError> {
+        let result = node::run(request).await?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
     #[tool(
         description = "Run a Python script against a Kubernetes service using mirrord to mirror traffic"
     )]
-    fn run_python(
+    async fn run_python(
         &self,
         #[tool(aggr)] request: python::Request,
     ) -> Result<CallToolResult, McpError> {
-        let result = python::run(request)?;
+        let result = python::run(request).await?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 }

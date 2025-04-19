@@ -1,11 +1,16 @@
-use super::executor::execute_mirrord_run; // Import the shared executor
-use super::runnable::MirrordRunnable; // Import the trait definition
+use super::executor::execute_mirrord_run;
+use super::runnable::MirrordRunnable;
 use anyhow::Result;
 use rmcp::Error as McpError;
 use rmcp::schemars;
-use std::ffi::OsString; // Needed for command args
+use std::ffi::OsString;
 use std::path::Path;
-use std::process::Command; // Needed for npm install
+use std::process::Command;
+use std::time::Duration;
+use tokio::task;
+use tokio::time::timeout;
+
+const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct Request {
@@ -21,13 +26,12 @@ pub struct Request {
     mirrord_config: String,
 }
 
-// Struct to hold Node.js-specific data and implement the trait
 struct NodeRunner<'a> {
     code: &'a str,
 }
 
 impl MirrordRunnable for NodeRunner<'_> {
-    fn setup_project(&self, project_dir: &Path) -> Result<(), McpError> {
+    async fn setup_project(&self, project_dir: &Path) -> Result<(), McpError> {
         // Write package.json
         let package_json = r#"
 {
@@ -62,23 +66,44 @@ impl MirrordRunnable for NodeRunner<'_> {
             "Installing Node.js dependencies in {}",
             project_dir.display()
         );
-        let npm_install_output = Command::new("npm")
-            .current_dir(project_dir)
-            .arg("install")
-            .output()
-            .map_err(|e| {
+        let project_dir_owned = project_dir.to_path_buf(); // Clone for task
+        let blocking_task = task::spawn_blocking(move || {
+            Command::new("npm")
+                .current_dir(&project_dir_owned) // Use owned path
+                .arg("install")
+                .output()
+        });
+        let npm_install_output = match timeout(NPM_INSTALL_TIMEOUT, blocking_task).await {
+            Ok(Ok(Ok(output))) => output,
+            Ok(Ok(Err(e))) => {
                 tracing::error!(error = %e, "Failed to execute npm install");
-                // Check if the error is 'NotFound'
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    McpError::internal_error(
+                return if e.kind() == std::io::ErrorKind::NotFound {
+                    Err(McpError::internal_error(
                         "Failed to run npm: 'npm' command not found in PATH.".to_string(),
                         None,
-                    )
+                    ))
                 } else {
-                    McpError::internal_error(format!("Failed to start npm process: {}", e), None)
-                }
-            })?;
-
+                    Err(McpError::internal_error(
+                        format!("Failed to start npm process: {}", e),
+                        None,
+                    ))
+                };
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "npm install blocking task failed");
+                return Err(McpError::internal_error(
+                    format!("npm install task failed: {}", e),
+                    None,
+                ));
+            }
+            Err(_) => {
+                tracing::error!("npm install timed out after {:?}", NPM_INSTALL_TIMEOUT);
+                return Err(McpError::internal_error(
+                    format!("npm install timed out after {:?}", NPM_INSTALL_TIMEOUT),
+                    None,
+                ));
+            }
+        };
         if !npm_install_output.status.success() {
             let stderr = String::from_utf8_lossy(&npm_install_output.stderr);
             let stdout = String::from_utf8_lossy(&npm_install_output.stdout);
@@ -101,7 +126,7 @@ impl MirrordRunnable for NodeRunner<'_> {
     }
 }
 
-pub fn run(request: Request) -> Result<String, McpError> {
+pub async fn run(request: Request) -> Result<String, McpError> {
     let runner = NodeRunner {
         code: &request.code,
     };
@@ -112,4 +137,5 @@ pub fn run(request: Request) -> Result<String, McpError> {
         &request.mirrord_config,
         "default",
     )
+    .await
 }

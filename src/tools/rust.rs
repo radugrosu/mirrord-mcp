@@ -6,6 +6,11 @@ use rmcp::schemars;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+use tokio::task;
+use tokio::time::timeout;
+
+const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct Request {
@@ -28,7 +33,7 @@ struct RustRunner<'a> {
 }
 
 impl MirrordRunnable for RustRunner<'_> {
-    fn setup_project(&self, project_dir: &Path) -> Result<(), McpError> {
+    async fn setup_project(&self, project_dir: &Path) -> Result<(), McpError> {
         // Ensure src directory exists
         let src_dir = project_dir.join("src");
         std::fs::create_dir_all(&src_dir).map_err(|e| {
@@ -99,22 +104,49 @@ codegen-units = 256 # Default is usually fine
             _ => &["build", "--release"][..], // Default to release
         };
 
-        let compile_output = Command::new("cargo")
-            .current_dir(project_dir)
-            .args(compile_args)
-            .output()
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to execute cargo build");
-                // Check if the error is 'NotFound'
+        let project_dir_owned = project_dir.to_path_buf(); // Clone PathBuf to move into task
+        let blocking_task = task::spawn_blocking(move || {
+            let mut command = Command::new("cargo");
+            command
+                .current_dir(project_dir_owned)
+                .args(compile_args)
+                .output()
+        });
+
+        let compile_output = match timeout(CARGO_BUILD_TIMEOUT, blocking_task).await {
+            Ok(Ok(Ok(output))) => Ok(output), // All succeeded
+            Ok(Ok(Err(e))) => {
+                // Command::output failed
+                tracing::error!(error = %e, "Failed to run cargo build");
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    McpError::internal_error(
-                        "Failed to run cargo: 'cargo' command not found in PATH.".to_string(),
+                    Err(McpError::internal_error(
+                        "Failed to execute cargo: 'cargo' command not found in PATH.".to_string(),
                         None,
-                    )
+                    ))
                 } else {
-                    McpError::internal_error(format!("Failed to start cargo process: {}", e), None)
+                    Err(McpError::internal_error(
+                        format!("Failed to start cargo process: {}", e),
+                        None,
+                    ))
                 }
-            })?;
+            }
+            Ok(Err(e)) => {
+                // spawn_blocking failed
+                tracing::error!(error = %e, "cargo blocking task failed");
+                Err(McpError::internal_error(
+                    format!("cargo task failed: {}", e),
+                    None,
+                ))
+            }
+            Err(_) => {
+                // Timeout elapsed
+                tracing::error!("Cargo build timed out after {:?}", CARGO_BUILD_TIMEOUT);
+                Err(McpError::internal_error(
+                    format!("Cargo build timed out after {:?}", CARGO_BUILD_TIMEOUT),
+                    None,
+                ))
+            }
+        }?;
 
         if !compile_output.status.success() {
             let stderr = String::from_utf8_lossy(&compile_output.stderr);
@@ -166,7 +198,7 @@ impl RustRunner<'_> {
     }
 }
 
-pub fn run(request: Request) -> Result<String, McpError> {
+pub async fn run(request: Request) -> Result<String, McpError> {
     // Determine compile mode
     let compile_mode =
         std::env::var("MCP_SERVICE_COMPILE_MODE").unwrap_or_else(|_| "release".to_string());
@@ -184,4 +216,5 @@ pub fn run(request: Request) -> Result<String, McpError> {
         &request.mirrord_config,
         "default",
     )
+    .await
 }
