@@ -28,7 +28,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (sse_server, router) = SseServer::new(config);
-    // Do something with the router, e.g., add routes or middleware
     let listener = tokio::net::TcpListener::bind(sse_server.config.bind).await?;
     let ct = sse_server.config.ct.child_token();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {

@@ -2,6 +2,7 @@
 edition = "2024"
 name = "mirrord-mcp-server"
 version = "0.1.0"
+authors = ["Radu Grosu <radu.grosu@gmail.com"]
 
 [dependencies]
 anyhow = "1.0"
