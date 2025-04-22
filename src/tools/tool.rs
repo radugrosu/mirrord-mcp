@@ -1,16 +1,27 @@
 use anyhow::Result;
-use rmcp::Error as McpError;
 use rmcp::model::Content;
+use rmcp::{Error as McpError, schemars};
 use rmcp::{
     ServerHandler,
     model::{CallToolResult, ServerCapabilities, ServerInfo},
     tool,
 };
 
-use super::node;
-use super::python;
-use super::rust;
+use super::executor::execute_mirrord_run;
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct Request {
+    #[schemars(
+        description = "Complete command-line statement to run, using absolute paths for binaries, and all necessary flags."
+    )]
+    cmd_str: String,
+    #[schemars(description = "Kubernetes deployment name.")]
+    deployment: String,
+    #[schemars(
+        description = "Mirrord config in JSON format.e.g., '{\"feature\": {\"network\": {\"incoming\": {\"mode\": \"mirror\", \"ports\": [ 8888 ] } } }'."
+    )]
+    mirrord_config: String,
+}
 #[derive(Debug, Clone)]
 pub struct MirrordService;
 
@@ -23,33 +34,16 @@ impl MirrordService {
 #[tool(tool_box)]
 impl MirrordService {
     #[tool(
-        description = "Run a rust binary against a Kubernetes service using mirrord to mirror traffic"
+        description = "Run a command-line statement against a Kubernetes service using mirrord to mirror traffic. Use absolute paths for binaries and all necessary flags."
     )]
-    async fn run_rust(
-        &self,
-        #[tool(aggr)] request: rust::Request,
-    ) -> Result<CallToolResult, McpError> {
-        let result = rust::run(request).await?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
-    }
-    #[tool(
-        description = "Run a JavaScript script against a Kubernetes service using mirrord to mirror traffic"
-    )]
-    async fn run_node(
-        &self,
-        #[tool(aggr)] request: node::Request,
-    ) -> Result<CallToolResult, McpError> {
-        let result = node::run(request).await?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
-    }
-    #[tool(
-        description = "Run a Python script against a Kubernetes service using mirrord to mirror traffic"
-    )]
-    async fn run_python(
-        &self,
-        #[tool(aggr)] request: python::Request,
-    ) -> Result<CallToolResult, McpError> {
-        let result = python::run(request).await?;
+    async fn run(&self, #[tool(aggr)] request: Request) -> Result<CallToolResult, McpError> {
+        let result = execute_mirrord_run(
+            &request.cmd_str,
+            &request.deployment,
+            &request.mirrord_config,
+            "default",
+        )
+        .await?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 }

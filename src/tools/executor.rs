@@ -1,4 +1,3 @@
-use super::{runnable::MirrordRunnable, utils::update_mirrord_config};
 use anyhow::Result;
 use rmcp::Error as McpError;
 use std::io::Write;
@@ -7,6 +6,7 @@ use std::time::Duration;
 use tempfile::{NamedTempFile, TempPath}; // Use TempPath for config file persistence
 use tokio::task;
 use tokio::time::timeout;
+use crate::tools::utils::update_mirrord_config;
 
 const MIRRORD_EXEC_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
 
@@ -17,37 +17,24 @@ const MIRRORD_EXEC_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
 /// is provided via a type implementing `MirrordRunnable`.
 ///
 /// # Arguments
+/// * `cmd_str` - The command-line statement to run.
 /// * `deployment` - The target Kubernetes deployment name.
 /// * `mirrord_config` - The base mirrord configuration (JSON string).
 /// * `namespace` - The target Kubernetes namespace (currently hardcoded, consider making configurable).
-/// * `setup_project` - A closure that takes the temporary project directory `Path`
-///   and performs language-specific setup (e.g., writing source files, installing deps).
-/// * `get_command_args` - A closure that takes the temporary project directory `Path`
-///   and returns the executable and arguments to be passed to `mirrord exec`.
 ///
 /// # Returns
 /// The stdout of the successful execution, or an McpError.
-pub async fn execute_mirrord_run<R: MirrordRunnable>(
-    runner: &R,
+pub async fn execute_mirrord_run(
+    cmd_str: &str,
     deployment: &str,
     mirrord_config: &str,
     namespace: &str,
 ) -> Result<String, McpError> {
-    // --- 1. Create Temp Directory ---
-    let temp_dir = tempfile::tempdir().map_err(|e| {
-        tracing::error!(error = %e, "Failed to create temporary directory");
-        McpError::internal_error("Failed to create temporary directory".to_string(), None)
+    let args = shell_words::split(cmd_str).map_err(|e| {
+        tracing::error!(error = %e, "Failed to parse command line arguments");
+        McpError::internal_error("Failed to parse command line arguments".to_string(), None)
     })?;
-    let project_dir = temp_dir.path();
-    tracing::debug!("Created project directory: {}", project_dir.display());
-
-    // --- 2. Run Language-Specific Setup ---
-    runner.setup_project(project_dir).await.inspect_err(|_| {
-        tracing::error!("Project setup failed in {}", project_dir.display());
-    })?;
-    tracing::debug!("Project setup completed for {}", project_dir.display());
-
-    // --- 3. Update and Write Mirrord Config ---
+    // --- 1. Update and Write Mirrord Config ---
     let config_str = update_mirrord_config(mirrord_config, deployment, namespace)
         .await
         .inspect_err(|e| {
@@ -67,12 +54,6 @@ pub async fn execute_mirrord_run<R: MirrordRunnable>(
     let config_path: TempPath = config_file.into_temp_path();
     tracing::debug!("Wrote mirrord config to {}", config_path.display());
 
-    // --- 4. Get Language-Specific Command Args ---
-    let command_args = runner.get_command_args(project_dir).inspect_err(|_| {
-        tracing::error!("Failed to determine command arguments");
-    })?;
-    tracing::debug!("Command args to execute: {:?}", command_args);
-
     // --- 5. Execute Mirrord ---
     let config_path_owned = config_path.to_path_buf(); // Clone PathBuf to move into task
     let blocking_task = task::spawn_blocking(move || {
@@ -81,7 +62,7 @@ pub async fn execute_mirrord_run<R: MirrordRunnable>(
             .arg("exec")
             .arg("--config-file")
             .arg(&config_path_owned); // Use owned path
-        for arg in command_args {
+        for arg in args {
             command.arg(arg);
         }
         tracing::info!(command = ?command, "Executing mirrord command in blocking task...");
